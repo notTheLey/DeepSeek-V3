@@ -7,50 +7,41 @@ from triton import Config
 
 
 @triton.jit
-def act_quant_kernel(x_ptr, y_ptr, s_ptr, BLOCK_SIZE: tl.constexpr):
-    """
-    Quantizes the input tensor `x_ptr` and stores the result in `y_ptr` and the scaling factor in `s_ptr`.
-
-    Args:
-        x_ptr (triton.Pointer): Pointer to the input tensor.
-        y_ptr (triton.Pointer): Pointer to the output tensor where quantized values will be stored.
-        s_ptr (triton.Pointer): Pointer to the output tensor where scaling factors will be stored.
-        BLOCK_SIZE (tl.constexpr): The size of the block to be processed by each program instance.
-
-    Returns:
-        None
-    """
+def act_quant_kernel(input_ptr, output_ptr, scale_ptr, BLOCK_SIZE: tl.constexpr):
     pid = tl.program_id(axis=0)
-    offs = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
-    x = tl.load(x_ptr + offs).to(tl.float32)
-    s = tl.max(tl.abs(x)) / 448.
-    y = x / s
-    y = y.to(y_ptr.dtype.element_ty)
-    tl.store(y_ptr + offs, y)
-    tl.store(s_ptr + pid, s)
+    offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    x = tl.load(input_ptr + offsets).to(tl.float32)
+    scale_factor = tl.max(tl.abs(x)) / 448.0
+    quantized = x / scale_factor
+    quantized = quantized.to(output_ptr.dtype.element_ty)
+    tl.store(output_ptr + offsets, quantized)
+    tl.store(scale_ptr + pid, scale_factor)
 
-
-def act_quant(x: torch.Tensor, block_size: int = 128) -> Tuple[torch.Tensor, torch.Tensor]:
+def act_quant(x: torch.Tensor, block_size: int = 128, dtype=torch.float8_e4m3fn) -> Tuple[torch.Tensor, torch.Tensor]:
     """
-    Quantizes the input tensor `x` using block-wise quantization.
+    Quantizes an input tensor using block-wise quantization.
 
     Args:
-        x (torch.Tensor): The input tensor to be quantized. Must be contiguous and its last dimension size must be divisible by `block_size`.
-        block_size (int, optional): The size of the blocks to be used for quantization. Default is 128.
+        x: Input tensor (must be contiguous and floating-point).
+        block_size: Size of blocks for quantization (power of 2).
+        dtype: Target data type for quantized output (default: torch.float8_e4m3fn).
 
     Returns:
-        Tuple[torch.Tensor, torch.Tensor]: A tuple containing:
-            - The quantized tensor with dtype `torch.float8_e4m3fn`.
-            - A tensor of scaling factors with dtype `torch.float32`.
+        Tuple containing the quantized tensor and scaling factors.
     """
-    assert x.is_contiguous(), 'Input tensor must be contiguous'
-    assert x.size(-1) % block_size == 0, f'Last dimension size must be divisible by block_size (block_size={block_size})'
-    y = torch.empty_like(x, dtype=torch.float8_e4m3fn)
+    assert x.is_contiguous(), "Input tensor must be contiguous"
+    assert x.dtype.is_floating_point, "Input must be a floating-point tensor"
+    assert block_size > 0 and (block_size & (block_size - 1)) == 0, "block_size must be a power of 2"
+    
+    if x.size(-1) % block_size != 0:
+        pad_size = block_size - (x.size(-1) % block_size)
+        x = torch.nn.functional.pad(x, (0, pad_size))
+    
+    y = torch.empty_like(x, dtype=dtype)
     s = x.new_empty(*x.size()[:-1], x.size(-1) // block_size, dtype=torch.float32)
-    grid = lambda meta: (triton.cdiv(x.numel(), meta['BLOCK_SIZE']), )
+    grid = lambda meta: (triton.cdiv(x.numel(), meta['BLOCK_SIZE']),)
     act_quant_kernel[grid](x, y, s, BLOCK_SIZE=block_size)
     return y, s
-
 
 @triton.jit
 def weight_dequant_kernel(x_ptr, s_ptr, y_ptr, M, N, BLOCK_SIZE: tl.constexpr):
