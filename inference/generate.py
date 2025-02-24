@@ -33,7 +33,7 @@ def generate(
     prompt_tokens: List[List[int]],
     max_new_tokens: int,
     eos_id: int,
-    temperature: float = 1.0
+    temperature: float = 1.5
 ) -> List[List[int]]:
     """
     Generates new tokens based on the given prompt tokens using the specified model.
